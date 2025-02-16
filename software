@@ -1,0 +1,515 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <PID_v1_bc.h>
+#include <Adafruit_VL53L0X.h>
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ============================
+// Maze Matrix
+// ============================
+const int maze[8][8] = {
+    {6, 5, 4, 3, 3, 4, 5, 6},
+    {5, 4, 3, 2, 2, 3, 4, 5},
+    {4, 3, 2, 1, 1, 2, 3, 4},
+    {3, 2, 1, 0, 0, 1, 2, 3},
+    {3, 2, 1, 0, 0, 1, 2, 3},
+    {4, 3, 2, 1, 1, 2, 3, 4},
+    {5, 4, 3, 2, 2, 3, 4, 5},
+    {6, 5, 4, 3, 3, 4, 5, 6}
+};
+
+// ============================
+// Robot Position
+// ============================
+int robotX = 7; // Starting X position (bottom-right corner)
+int robotY = 0; // Starting Y position
+int robotDirection = 90; // Initial direction (facing up, 90 degrees)
+
+// ============================
+// Motor & Encoder Configuration
+// ============================
+#define AIN1 14  // Right motor forward
+#define AIN2 27  // Right motor reverse
+#define BIN1 26  // Left motor forward
+#define BIN2 25  // Left motor reverse
+#define PWMA 19  // Right motor PWM
+#define PWMB 18  // Left motor PWM
+#define LEFT_ENC_A 32
+#define LEFT_ENC_B 13
+#define RIGHT_ENC_A 33
+#define RIGHT_ENC_B 12
+
+// ============================
+// Path Stack
+// ============================
+std::vector<int> pathStack; // Stack to store the robot's path
+enum MoveDirection { FORWARD_MOVE, LEFT_TURN, RIGHT_TURN, BACKTRACK_MOVE };
+
+// ============================
+// MPU6050 & PID Configuration
+// ============================
+Adafruit_MPU6050 mpu;
+double targetYaw = 0;  // Target yaw angle
+double currentYaw = 0, yawError = 0, correction = 0;
+double Kp = 2, Ki = 0.02, Kd = 1;
+PID pidController(&yawError, &correction, &targetYaw, Kp, Ki, Kd, DIRECT);
+
+// ============================
+// Encoder Variables
+// ============================
+volatile long leftEncoderCounts = 0;
+volatile long rightEncoderCounts = 0;
+
+// Motor Speed Variables
+int baseSpeedLeft = 87;   // Base speed for left motor
+int baseSpeedRight = 84;  // Base speed for right motor
+int baseSpeedTurn = 65;   // Very low speed for turning
+int baseSpeedTurn180 = 53; // Higher speed for 180-degree turns
+bool stopMotors = false;  // Flag to stop motors
+unsigned long startTime = 0;
+esp_timer_handle_t controller_timer = nullptr;
+
+// ============================
+// Sensor Configuration
+// ============================
+const int lidar1_xshut = 5;  // Right sensor
+const int lidar2_xshut = 17; // Front sensor
+const int lidar3_xshut = 16; // Left sensor
+Adafruit_VL53L0X lox1 = Adafruit_VL53L0X();
+Adafruit_VL53L0X lox2 = Adafruit_VL53L0X();
+Adafruit_VL53L0X lox3 = Adafruit_VL53L0X();
+
+// ============================
+// State Machine
+// ============================
+enum RobotState {
+    FORWARD,
+    STOP_AND_READ_SENSORS,
+    TURN_RIGHT,
+    TURN_LEFT,
+    CONTINUE_FORWARD,
+    BACKTRACK // Added BACKTRACK state
+};
+RobotState currentState = FORWARD;
+
+// ============================
+// Constants
+// ============================
+const int TICKS_PER_CELL = 230;  // Assuming 32 ticks per rotation and 4cm diameter -> 20cm = 160 ticks
+const int SENSOR_THRESHOLD = 7; // Distance in cm to consider a wall
+
+// ============================
+// Function Declarations
+// ============================
+void setLeftPwm(int pwm);
+void setRightPwm(int pwm);
+void IRAM_ATTR readLeftEncoder();
+void IRAM_ATTR readRightEncoder();
+void updateYaw();
+void ControllerLogic(void* arg);
+void stopMotorsNow();
+void resetEncoders();
+void readSensors(int& rightDistance, int& frontDistance, int& leftDistance);
+
+// ============================
+// Setup Function
+// ============================
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+
+    // Initialize MPU6050
+    if (!mpu.begin()) {
+        Serial.println("❌ MPU6050 Not Found! Check wiring.");
+        while (1);
+    }
+    Serial.println("✅ MPU6050 Ready!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    // Initialize Sensors
+    pinMode(lidar1_xshut, OUTPUT);
+    pinMode(lidar2_xshut, OUTPUT);
+    pinMode(lidar3_xshut, OUTPUT);
+    digitalWrite(lidar1_xshut, LOW);
+    digitalWrite(lidar2_xshut, LOW);
+    digitalWrite(lidar3_xshut, LOW);
+    delay(50);
+
+    // Sensor 1
+    digitalWrite(lidar1_xshut, HIGH);
+    delay(50);
+    if (!lox1.begin()) {
+        Serial.println("❌ ERROR: Sensor 1 not detected! Check wiring.");
+        while (1);
+    }
+    lox1.setAddress(0x30);
+    Serial.println("✅ Sensor 1 Ready at 0x30");
+
+    // Sensor 2
+    digitalWrite(lidar2_xshut, HIGH);
+    delay(50);
+    if (!lox2.begin()) {
+        Serial.println("❌ ERROR: Sensor 2 not detected! Check wiring.");
+        while (1);
+    }
+    lox2.setAddress(0x31);
+    Serial.println("✅ Sensor 2 Ready at 0x31");
+
+    // Sensor 3
+    digitalWrite(lidar3_xshut, HIGH);
+    delay(50);
+    if (!lox3.begin()) {
+        Serial.println("❌ ERROR: Sensor 3 not detected! Check wiring.");
+        while (1);
+    }
+    lox3.setAddress(0x32);
+    Serial.println("✅ Sensor 3 Ready at 0x32");
+
+    // Motor Setup
+    pinMode(AIN1, OUTPUT);
+    pinMode(AIN2, OUTPUT);
+    pinMode(BIN1, OUTPUT);
+    pinMode(BIN2, OUTPUT);
+    pinMode(PWMA, OUTPUT);
+    pinMode(PWMB, OUTPUT);
+   
+       // Set Initial PWM
+    setLeftPwm(baseSpeedLeft);
+    setRightPwm(baseSpeedRight);
+
+    // Encoder Setup
+    pinMode(LEFT_ENC_A, INPUT_PULLUP);
+    pinMode(LEFT_ENC_B, INPUT_PULLUP);
+    pinMode(RIGHT_ENC_A, INPUT_PULLUP);
+    pinMode(RIGHT_ENC_B, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_A), readRightEncoder, RISING);
+    attachInterrupt(digitalPinToInterrupt(LEFT_ENC_A), readLeftEncoder, RISING);
+
+    // Configure PID Controller
+    pidController.SetMode(AUTOMATIC);
+    pidController.SetOutputLimits(-30, 30);
+
+    // Start Movement Timer
+    esp_timer_create_args_t timer_args = {
+        .callback = &ControllerLogic,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pid_timer",
+        .skip_unhandled_events = true
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &controller_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(controller_timer, 50000)); // 50ms loop
+        // Start Movement Timer
+    startTime = millis();
+}
+// ============================
+// MPU6050 Yaw Correction
+// ============================
+void updateYaw() {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    double gyroZ = g.gyro.z * (180.0 / PI);
+    currentYaw += gyroZ * 0.05;
+
+    // Ensure Yaw Stays Between -180 and +180
+    while (currentYaw > 180) currentYaw -= 360;
+    while (currentYaw < -180) currentYaw += 360;
+    yawError = targetYaw - currentYaw;
+}
+
+// ============================
+// Main Logic
+// ============================
+void ControllerLogic(void* arg) {
+    static unsigned long startTime = millis();
+    portENTER_CRITICAL(&mux);
+    long localLeftEncoderCounts = leftEncoderCounts;
+    long localRightEncoderCounts = rightEncoderCounts;
+    portEXIT_CRITICAL(&mux);
+
+    switch (currentState) {
+        case FORWARD:
+            if (localLeftEncoderCounts >= TICKS_PER_CELL || localRightEncoderCounts >= TICKS_PER_CELL) {
+                stopMotorsNow();
+                resetEncoders();
+                delay(500);
+                currentState = STOP_AND_READ_SENSORS;
+                startTime = millis();
+                Serial.println("🛑 Stopped After Moving One Cell");
+
+                // Push FORWARD_MOVE to the stack
+                pathStack.push_back(FORWARD_MOVE);
+                Serial.print("📌 Path Stack Size: ");
+                Serial.println(pathStack.size());
+
+                // Update robot position
+                updateRobotPosition();
+
+                // Check if the goal is reached
+                if (maze[robotX][robotY] == 0) {
+                    Serial.println("🎉 Goal Reached! Stopping Robot.");
+                    stopMotorsNow();
+                    currentState = FORWARD; // Stay in FORWARD state but do nothing
+                    return;
+                }
+            } else {
+                int leftSpeed = baseSpeedLeft - correction;
+                int rightSpeed = baseSpeedRight + correction;
+                setLeftPwm(leftSpeed);
+                setRightPwm(rightSpeed);
+            }
+            break;
+
+        case STOP_AND_READ_SENSORS:
+            if (millis() - startTime >= 1000) { // Wait 1 second before reading sensors
+                int rightDistance, frontDistance, leftDistance;
+                readSensors(rightDistance, frontDistance, leftDistance);
+
+                if (rightDistance > SENSOR_THRESHOLD) {
+                    currentState = TURN_RIGHT;
+                    targetYaw += 90;
+                    Serial.println("🔄 Turning Right");
+
+                    // Push RIGHT_TURN to the stack
+                    pathStack.push_back(RIGHT_TURN);
+                    Serial.print("📌 Path Stack Size: ");
+                    Serial.println(pathStack.size());
+                } else if (leftDistance > SENSOR_THRESHOLD) {
+                    currentState = TURN_LEFT;
+                    targetYaw -= 90;
+                    Serial.println("🔄 Turning Left");
+
+                    // Push LEFT_TURN to the stack
+                    pathStack.push_back(LEFT_TURN);
+                    Serial.print("📌 Path Stack Size: ");
+                    Serial.println(pathStack.size());
+                } else if (frontDistance <= SENSOR_THRESHOLD && rightDistance <= SENSOR_THRESHOLD && leftDistance <= SENSOR_THRESHOLD) {
+                    // Walls on all three sides -> Backtrack
+                    currentState = BACKTRACK;
+                    targetYaw += 180; // Rotate 180 degrees
+                    Serial.println("🔄 Backtracking (180-degree Turn)");
+
+                    // Push BACKTRACK_MOVE to the stack
+                    pathStack.push_back(BACKTRACK_MOVE);
+                    Serial.print("📌 Path Stack Size: ");
+                    Serial.println(pathStack.size());
+                } else {
+                    currentState = CONTINUE_FORWARD;
+                    Serial.println("➡ Continuing Forward");
+                }
+                startTime = millis();
+            }
+            break;
+
+        case TURN_RIGHT:
+case TURN_LEFT:
+    if (millis() - startTime >= 1000) { // Wait 1.5 seconds for turning
+        stopMotorsNow();
+        currentState = FORWARD;
+        resetEncoders();
+        Serial.println("➡ Resuming Forward Movement");
+        delay(500);
+
+        // Update robot direction
+        if (currentState == TURN_RIGHT) {
+            robotDirection -= 90; // Subtract 90 degrees for a right turn
+        } else if (currentState == TURN_LEFT) {
+            robotDirection += 90; // Add 90 degrees for a left turn
+        }
+
+        // Normalize direction to [0, 360)
+        while (robotDirection < 0) robotDirection += 360;
+        while (robotDirection >= 360) robotDirection -= 360;
+
+    } else {
+        int leftSpeed, rightSpeed;
+
+        if (currentState == TURN_RIGHT) {
+            // Right turn: Right motor forward, left motor backward
+            leftSpeed = -(baseSpeedTurn - 20);  // Left motor slower (reverse)
+            rightSpeed = baseSpeedTurn + 20;   // Right motor faster (forward)
+        } else if (currentState == TURN_LEFT) {
+            // Left turn: Left motor forward, right motor backward
+            leftSpeed = baseSpeedTurn + 20;    // Left motor faster (forward)
+            rightSpeed = -(baseSpeedTurn - 20); // Right motor slower (reverse)
+        }
+
+        // Apply motor speeds
+        setLeftPwm(leftSpeed);
+        setRightPwm(rightSpeed);
+    }
+    break;
+
+case BACKTRACK:
+    if (millis() - startTime >= 2000) { // Wait 2 seconds for 180-degree turn
+        stopMotorsNow();
+        currentState = FORWARD;
+        resetEncoders();
+        Serial.println("➡ Resuming Forward Movement After Backtrack");
+
+        // Pop the last move from the stack during backtracking
+        if (!pathStack.empty()) {
+            int lastMove = pathStack.back();
+            pathStack.pop_back();
+            Serial.print("🔙 Popped Move: ");
+            switch (lastMove) {
+                case FORWARD_MOVE:
+                    Serial.println("FORWARD_MOVE");
+                    break;
+                case LEFT_TURN:
+                    Serial.println("LEFT_TURN");
+                    break;
+                case RIGHT_TURN:
+                    Serial.println("RIGHT_TURN");
+                    break;
+                case BACKTRACK_MOVE:
+                    Serial.println("BACKTRACK_MOVE");
+                    break;
+            }
+            Serial.print("📌 Path Stack Size After Pop: ");
+            Serial.println(pathStack.size());
+        }
+
+        // Update robot direction for 180-degree turn
+        robotDirection += 180;
+        while (robotDirection >= 360) robotDirection -= 360;
+
+    } else {
+        // 180-degree turn: Swap motors for consistent behavior
+        int leftSpeed = -(baseSpeedTurn180 - 30);  // Left motor slower (reverse)
+        int rightSpeed = baseSpeedTurn180 + 30;   // Right motor faster (forward)
+        setLeftPwm(leftSpeed);
+        setRightPwm(rightSpeed);
+    }
+    break;
+
+        case CONTINUE_FORWARD:
+            setLeftPwm(baseSpeedLeft);
+            setRightPwm(baseSpeedRight);
+            currentState = FORWARD;
+            break;
+    }
+
+    updateYaw();
+    if (currentState == FORWARD || currentState == TURN_RIGHT || currentState == TURN_LEFT || currentState == BACKTRACK) {
+        pidController.Compute();
+    }
+}
+
+// ============================
+// Update Robot Position
+// ============================
+void updateRobotPosition() {
+    switch (robotDirection) {
+        case 0:   // Facing right
+            robotY++;
+            break;
+        case 90:  // Facing up
+            robotX--;
+            break;
+        case 180: // Facing left
+            robotY--;
+            break;
+        case 270: // Facing down
+            robotX++;
+            break;
+    }
+
+    // Ensure the robot stays within bounds
+    robotX = constrain(robotX, 0, 7);
+    robotY = constrain(robotY, 0, 7);
+
+    Serial.print("📍 Updated Position: (");
+    Serial.print(robotX);
+    Serial.print(", ");
+    Serial.print(robotY);
+    Serial.print(") Value: ");
+    Serial.println(maze[robotX][robotY]);
+}
+// ============================
+// Sensor Reading Function
+// ============================
+void readSensors(int& rightDistance, int& frontDistance, int& leftDistance) {
+    VL53L0X_RangingMeasurementData_t measure1, measure2, measure3;
+    lox1.rangingTest(&measure1, false);
+    lox2.rangingTest(&measure2, false);
+    lox3.rangingTest(&measure3, false);
+
+    rightDistance = (measure1.RangeStatus != 4) ? measure1.RangeMilliMeter / 10 : SENSOR_THRESHOLD;
+    frontDistance = (measure2.RangeStatus != 4) ? measure2.RangeMilliMeter / 10 : SENSOR_THRESHOLD;
+    leftDistance = (measure3.RangeStatus != 4) ? measure3.RangeMilliMeter / 10 : SENSOR_THRESHOLD;
+
+    Serial.print("📡 Sensors: Right=");
+    Serial.print(rightDistance);
+    Serial.print("cm, Front=");
+    Serial.print(frontDistance);
+    Serial.print("cm, Left=");
+    Serial.print(leftDistance);
+    Serial.println("cm");
+}
+
+// ============================
+// Motor Control Functions
+// ============================
+void setLeftPwm(int pwm) {
+    pwm = constrain(pwm, 0, 255);  
+    analogWrite(PWMB, pwm);
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+}
+
+void setRightPwm(int pwm) {
+    pwm = constrain(pwm, 0, 255);
+    analogWrite(PWMA, pwm);
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+}
+
+// ============================
+// Encoder Interrupts
+// ============================
+void IRAM_ATTR readLeftEncoder() {
+    portENTER_CRITICAL_ISR(&mux);
+    leftEncoderCounts++;
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR readRightEncoder() {
+    portENTER_CRITICAL_ISR(&mux);
+    rightEncoderCounts++;
+    portEXIT_CRITICAL_ISR(&mux);
+}
+
+// ============================
+// Stop Motors Function
+// ============================
+void stopMotorsNow() {
+    setLeftPwm(0);
+    setRightPwm(0);
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+}
+
+// ============================
+// Reset Encoders Function
+// ============================
+void resetEncoders() {
+    portENTER_CRITICAL(&mux);
+    leftEncoderCounts = 0;
+    rightEncoderCounts = 0;
+    portEXIT_CRITICAL(&mux);
+}
+
+// ============================
+// Main Loop
+// ============================
+void loop() {
+    // Movement is handled by the ESP32 timer
+}
